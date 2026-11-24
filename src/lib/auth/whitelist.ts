@@ -10,6 +10,13 @@ export type AllowedUser = {
   role: UserRole;
 };
 
+export class WhitelistLookupError extends Error {
+  constructor(message: string) {
+    super(`Falha ao consultar a whitelist: ${message}`);
+    this.name = "WhitelistLookupError";
+  }
+}
+
 export function normalizeEmail(email: string) {
   return email.trim().toLowerCase();
 }
@@ -25,9 +32,10 @@ export async function findAllowedUser(email: string): Promise<AllowedUser | null
     .maybeSingle();
 
   if (error) {
-    // Fail closed: a lookup error never grants access.
+    // Fail closed: a lookup error never grants access — but surface it as a
+    // configuration error instead of "e-mail sem acesso".
     console.error("[whitelist] lookup failed", error.message);
-    return null;
+    throw new WhitelistLookupError(error.message);
   }
   if (!data) return null;
 

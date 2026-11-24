@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isAuthApiError, type SupabaseClient } from "@supabase/supabase-js";
 import { AUTH } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
-import { findAllowedUser, normalizeEmail } from "@/lib/auth/whitelist";
+import { findAllowedUser, normalizeEmail, type AllowedUser } from "@/lib/auth/whitelist";
 import { isTrustedDevice, touchTrustedDevice, trustThisDevice } from "@/lib/auth/trusted-device";
 import { audit } from "@/lib/auth/audit";
 import { getSessionState } from "@/lib/auth/dal";
@@ -29,10 +29,21 @@ const MSG = {
   badTotp: "Código incorreto. Confira se o horário do celular está automático e tente de novo.",
   sessionLost: "Sua sessão expirou. Comece de novo pelo e-mail.",
   generic: "Não foi possível concluir agora. Tente de novo em instantes.",
+  config:
+    "Não foi possível verificar o acesso (erro de configuração do servidor). Avise o time técnico.",
 } as const;
 
 const emailSchema = z.email().transform(normalizeEmail);
 const codeSchema = (len: number) => z.string().trim().regex(new RegExp(`^\\d{${len}}$`));
+
+/** Whitelist lookup that turns infra/config errors into a clear message. */
+async function checkWhitelist(email: string): Promise<{ allowed: AllowedUser | null } | Fail> {
+  try {
+    return { allowed: await findAllowedUser(email) };
+  } catch {
+    return { ok: false, error: MSG.config };
+  }
+}
 
 function authErrorMessage(error: unknown, fallback: string) {
   if (isAuthApiError(error) && error.status === 429) return MSG.rateLimited;
@@ -47,8 +58,9 @@ export async function requestEmailCode(rawEmail: string): Promise<Ok | Fail> {
   if (!parsed.success) return { ok: false, error: MSG.invalidEmail };
   const email = parsed.data;
 
-  const allowed = await findAllowedUser(email);
-  if (!allowed) {
+  const check = await checkWhitelist(email);
+  if ("ok" in check) return check;
+  if (!check.allowed) {
     await audit("login_denied_not_allowed", { email });
     return { ok: false, error: MSG.notAllowed };
   }
@@ -65,6 +77,7 @@ export async function requestEmailCode(rawEmail: string): Promise<Ok | Fail> {
   });
 
   if (error) {
+    console.error("[auth] signInWithOtp failed", { status: error.status, code: error.code, message: error.message });
     await audit("email_code_failed", { email, metadata: { status: error.status, code: error.code } });
     return { ok: false, error: authErrorMessage(error, MSG.generic) };
   }
@@ -82,7 +95,10 @@ export async function verifyEmailCode(
 ): Promise<Ok<{ factor: SecondFactor }> | Fail> {
   const email = emailSchema.safeParse(rawEmail);
   const code = codeSchema(AUTH.emailOtpLength).safeParse(rawCode);
-  if (!email.success || !code.success) return { ok: false, error: MSG.badEmailCode };
+  if (!email.success || !code.success) {
+    console.error("[auth] verifyEmailCode: formato inválido", { codeLength: rawCode.trim().length, expected: AUTH.emailOtpLength });
+    return { ok: false, error: MSG.badEmailCode };
+  }
 
   const supabase = await createClient();
   const { data, error } = await supabase.auth.verifyOtp({
@@ -92,11 +108,17 @@ export async function verifyEmailCode(
   });
 
   if (error || !data.user) {
+    console.error("[auth] verifyOtp failed", error && { status: error.status, code: error.code, message: error.message });
     return { ok: false, error: authErrorMessage(error, MSG.badEmailCode) };
   }
 
   // Re-check: the user may have been deactivated after the code was sent.
-  if (!(await findAllowedUser(email.data))) {
+  const check = await checkWhitelist(email.data);
+  if ("ok" in check) {
+    await supabase.auth.signOut({ scope: "local" });
+    return check;
+  }
+  if (!check.allowed) {
     await supabase.auth.signOut({ scope: "local" });
     await audit("login_denied_not_allowed", { email: email.data, userId: data.user.id });
     return { ok: false, error: MSG.notAllowed };
@@ -120,7 +142,10 @@ async function resolveSecondFactor(
   email: string,
 ): Promise<Ok<{ factor: SecondFactor }> | Fail> {
   const { data: factors, error } = await supabase.auth.mfa.listFactors();
-  if (error) return { ok: false, error: MSG.generic };
+  if (error) {
+    console.error("[auth] listFactors failed", { status: error.status, code: error.code, message: error.message });
+    return { ok: false, error: MSG.generic };
+  }
 
   const verified = factors.totp[0];
 
@@ -144,7 +169,10 @@ async function resolveSecondFactor(
     friendlyName: "Painel de Entregas",
     issuer: "Mantiqueira · Painel de Entregas",
   });
-  if (enrollError || !enrolled) return { ok: false, error: MSG.generic };
+  if (enrollError || !enrolled) {
+    console.error("[auth] mfa.enroll failed", enrollError && { status: enrollError.status, code: enrollError.code, message: enrollError.message });
+    return { ok: false, error: MSG.generic };
+  }
 
   return {
     ok: true,

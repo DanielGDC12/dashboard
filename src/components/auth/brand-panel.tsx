@@ -4,7 +4,7 @@ import { Logo } from "./logo";
 export function BrandPanel() {
   return (
     <aside className="relative flex shrink-0 flex-col items-center bg-verde px-8 pb-8 pt-10 text-center text-white lg:min-h-screen lg:w-[560px] lg:px-[76px] lg:pt-[119px]">
-      <Logo className="h-9 w-auto lg:h-[52px]" />
+      <Logo className="h-9 w-auto text-white lg:h-[52px]" />
 
       <div className="mt-8 hidden flex-1 flex-col items-center lg:mt-[118px] lg:flex">
         <p className="text-[12px] font-bold uppercase tracking-[0.6px] text-limao">
