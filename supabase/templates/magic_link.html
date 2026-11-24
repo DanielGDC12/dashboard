@@ -1,0 +1,18 @@
+<!--
+  Supabase › Authentication › Emails › "Magic Link"
+  Assunto sugerido: "Seu código de acesso ao Painel de Entregas"
+  O painel usa o CÓDIGO ({{ .Token }}), não o link.
+-->
+<div style="font-family: Assistant, Arial, sans-serif; color: #2c2c2c; max-width: 480px; margin: 0 auto; padding: 32px 24px;">
+  <p style="font-size: 12px; font-weight: 700; letter-spacing: .6px; color: #005748; text-transform: uppercase; margin: 0 0 8px;">
+    Painel de Entregas · Mantiqueira em Casa
+  </p>
+  <h1 style="font-size: 22px; margin: 0 0 16px;">Seu código de acesso</h1>
+  <p style="font-size: 15px; margin: 0 0 24px;">Digite este código na tela de login. Ele expira em alguns minutos.</p>
+  <p style="font-family: 'IBM Plex Mono', monospace; font-size: 32px; letter-spacing: 8px; font-weight: 600; background: #f7f7f7; border-radius: 10px; padding: 16px; text-align: center; margin: 0 0 24px;">
+    {{ .Token }}
+  </p>
+  <p style="font-size: 13px; color: #616161; margin: 0;">
+    Se você não tentou entrar no painel, ignore este e-mail.
+  </p>
+</div>

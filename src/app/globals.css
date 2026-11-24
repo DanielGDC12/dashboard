@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+/*
+ * Mantiqueira em Casa — tokens do Painel de Entregas
+ * Fonte: Figma "13 · Componentes" (2868:4138) / project doc 01-design-system.md
+ */
+@theme inline {
+  --color-verde: #005748;
+  --color-verde-claro: #edf4f2;
+  --color-limao: #d4ed31;
+  --color-limao-claro: #fafce8;
+  --color-grafite: #2c2c2c;
+  --color-cinza: #eeeeee;
+  --color-fundo-bloco: #f7f7f7;
+  --color-borda: #e5e5e5;
+  --color-borda-forte: #d0d0d0;
+  --color-texto-secundario: #616161;
+  --color-erro: #c8102e;
+  --color-erro-claro: #fdecef;
+  --color-atencao: #f2be22;
+  --color-atencao-claro: #fffbea;
+  --color-atencao-texto: #7a5600;
+  --color-desabilitado: #e6e6e6;
+  --color-desabilitado-texto: #8a8a8a;
+
+  --font-sans: "Assistant", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  background: #ffffff;
+  color: var(--color-grafite);
+}
+
+body {
+  font-family: var(--font-sans);
+}
