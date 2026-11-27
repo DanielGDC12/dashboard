@@ -1,10 +1,15 @@
-const STEPS = ["E-mail", "Código", "Autenticador"] as const;
-
-/** Figma "step": 3 columns, 23 px circles joined by 2 px lines. */
-export function Stepper({ current }: { current: 0 | 1 | 2 }) {
+/**
+ * Figma "step": one column per step, 23 px circles joined by 2 px lines.
+ * Primeiro acesso: E-mail · Código · Autenticador. Acessos seguintes: E-mail · Autenticador.
+ */
+export function Stepper({ steps, current }: { steps: readonly string[]; current: number }) {
   return (
-    <ol className="grid grid-cols-3" aria-label="Etapas do login">
-      {STEPS.map((label, i) => {
+    <ol
+      className="grid"
+      style={{ gridTemplateColumns: `repeat(${steps.length}, minmax(0, 1fr))` }}
+      aria-label="Etapas do login"
+    >
+      {steps.map((label, i) => {
         const done = i < current;
         const active = i === current;
         return (

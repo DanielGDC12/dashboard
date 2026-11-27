@@ -2,6 +2,8 @@ import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import type { Metadata } from "next";
 import { getSessionState } from "@/lib/auth/dal";
+import { getRememberedEmail } from "@/lib/auth/trusted-device";
+import { getLoginStatus } from "@/lib/auth/mfa-login";
 import { BrandPanel } from "@/components/auth/brand-panel";
 import { LoginFlow } from "@/components/auth/login-flow";
 
@@ -28,7 +30,7 @@ async function LoginGate() {
 
   if (state.status === "authenticated") redirect("/");
   if (state.status === "needs_mfa") {
-    return <LoginFlow initial={{ step: "authenticator", email: state.email }} />;
+    return <LoginFlow initial={{ step: "authenticator", email: state.email, source: "session" }} />;
   }
   if (state.status === "not_allowed") {
     return (
@@ -40,6 +42,15 @@ async function LoginGate() {
         }}
       />
     );
+  }
+
+  // Computador lembrado: e-mail preenchido, direto para o código do app autenticador.
+  const remembered = await getRememberedEmail().catch(() => null);
+  const hasAuthenticator = remembered
+    ? Boolean((await getLoginStatus(remembered).catch(() => null))?.totpFactorId)
+    : false;
+  if (remembered && hasAuthenticator) {
+    return <LoginFlow initial={{ step: "authenticator", email: remembered, source: "remembered" }} />;
   }
   return <LoginFlow initial={{ step: "email" }} />;
 }

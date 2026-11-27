@@ -6,9 +6,11 @@ import { AUTH } from "@/lib/env";
 import {
   requestEmailCode,
   resumeSecondFactor,
+  startLogin,
   switchAccount,
   verifyEmailCode,
   verifyTotp,
+  verifyTotpLogin,
   type SecondFactor,
 } from "@/app/login/actions";
 import { OtpInput } from "./otp-input";
@@ -17,11 +19,19 @@ import { Alert, EnvBadge, InfoCallout, LinkButton, PrimaryButton } from "./ui";
 
 type Initial =
   | { step: "email"; error?: string }
-  | { step: "authenticator"; email: string };
+  /**
+   * session: já existe sessão aal1 (veio do código por e-mail) — retomar.
+   * remembered: computador lembrado — e-mail preenchido, só falta o código do app.
+   */
+  | { step: "authenticator"; email: string; source: "session" | "remembered" };
 
 type Step = "email" | "code" | "authenticator";
 
 const RESEND_SECONDS = 60;
+
+/** Primeiro acesso tem a etapa do código por e-mail; os seguintes, não. */
+const STEPS_FIRST_ACCESS = ["E-mail", "Código", "Autenticador"] as const;
+const STEPS_RETURNING = ["E-mail", "Autenticador"] as const;
 
 export function LoginFlow({ initial }: { initial: Initial }) {
   const router = useRouter();
@@ -31,8 +41,14 @@ export function LoginFlow({ initial }: { initial: Initial }) {
   const [email, setEmail] = useState(initial.step === "authenticator" ? initial.email : "");
   const [emailCode, setEmailCode] = useState("");
   const [totp, setTotp] = useState("");
-  const [trust, setTrust] = useState(false);
-  const [factor, setFactor] = useState<Exclude<SecondFactor, { next: "done" }> | null>(null);
+  const remembered = initial.step === "authenticator" && initial.source === "remembered";
+  const [trust, setTrust] = useState(remembered);
+  const [factor, setFactor] = useState<Exclude<SecondFactor, { next: "done" }> | null>(
+    remembered ? { next: "login" } : null,
+  );
+  const [firstAccess, setFirstAccess] = useState(
+    initial.step === "authenticator" && initial.source === "session",
+  );
   const [error, setError] = useState<string | null>(initial.step === "email" ? initial.error ?? null : null);
   const [notice, setNotice] = useState<string | null>(null);
   const [resendIn, setResendIn] = useState(0);
@@ -47,7 +63,7 @@ export function LoginFlow({ initial }: { initial: Initial }) {
 
   // Landing directly on step 3 (aal1 session after reload): load factor info.
   useEffect(() => {
-    if (initial.step !== "authenticator") return;
+    if (initial.step !== "authenticator" || initial.source !== "session") return;
     startTransition(async () => {
       const res = await resumeSecondFactor();
       if (!res.ok) {
@@ -78,8 +94,15 @@ export function LoginFlow({ initial }: { initial: Initial }) {
     setError(null);
     setNotice(null);
     startTransition(async () => {
-      const res = await requestEmailCode(email);
+      const res = await startLogin(email);
       if (!res.ok) return setError(res.error);
+      if (res.next === "totp") {
+        // Acesso recorrente: direto para o código do app autenticador.
+        setFirstAccess(false);
+        handleFactor({ next: "login" });
+        return;
+      }
+      setFirstAccess(true);
       setEmailCode("");
       setResendIn(RESEND_SECONDS);
       setStep("code");
@@ -116,12 +139,15 @@ export function LoginFlow({ initial }: { initial: Initial }) {
     if (!factor || code.length !== AUTH.totpLength) return;
     setError(null);
     startTransition(async () => {
-      const res = await verifyTotp({
-        factorId: factor.factorId,
-        code,
-        trustDevice: trust,
-        enrolling: factor.next === "enroll",
-      });
+      const res =
+        factor.next === "login"
+          ? await verifyTotpLogin({ email, code, rememberDevice: trust })
+          : await verifyTotp({
+              factorId: factor.factorId,
+              code,
+              rememberDevice: trust,
+              enrolling: factor.next === "enroll",
+            });
       if (!res.ok) {
         setTotp("");
         return setError(res.error);
@@ -135,6 +161,8 @@ export function LoginFlow({ initial }: { initial: Initial }) {
       await switchAccount();
       setStep("email");
       setFactor(null);
+      setFirstAccess(false);
+      setTrust(false);
       setEmailCode("");
       setTotp("");
       setError(null);
@@ -143,7 +171,8 @@ export function LoginFlow({ initial }: { initial: Initial }) {
     });
   }
 
-  const stepIndex = step === "email" ? 0 : step === "code" ? 1 : 2;
+  const steps = firstAccess ? STEPS_FIRST_ACCESS : STEPS_RETURNING;
+  const stepIndex = step === "email" ? 0 : step === "code" ? 1 : steps.length - 1;
 
   return (
     <div className="flex flex-col">
@@ -155,7 +184,7 @@ export function LoginFlow({ initial }: { initial: Initial }) {
       </header>
 
       <div className="mt-[26px]">
-        <Stepper current={stepIndex} />
+        <Stepper steps={steps} current={stepIndex} />
       </div>
 
       {step !== "email" && (
@@ -191,11 +220,12 @@ export function LoginFlow({ initial }: { initial: Initial }) {
                 className="h-11 rounded-full border border-transparent bg-cinza px-5 text-[15px] outline-none placeholder:text-texto-secundario focus:border-verde focus:bg-white focus:ring-2 focus:ring-verde/20"
               />
               <p className="text-[13px] text-texto-secundario">
-                Vamos enviar um código de {AUTH.emailOtpLength} dígitos para este e-mail.
+                No primeiro acesso, enviamos um código para este e-mail. Depois, basta o código do
+                app autenticador.
               </p>
             </div>
             <PrimaryButton type="submit" loading={pending} disabled={!email.trim()}>
-              Enviar código
+              Continuar
             </PrimaryButton>
           </form>
         )}
@@ -283,14 +313,14 @@ export function LoginFlow({ initial }: { initial: Initial }) {
                     onChange={(e) => setTrust(e.target.checked)}
                     className="size-5 cursor-pointer rounded accent-verde"
                   />
-                  Confiar neste computador por {AUTH.trustedDeviceDays} dias
+                  Lembrar meu e-mail neste computador por {AUTH.trustedDeviceDays} dias
                 </label>
 
                 <PrimaryButton type="submit" loading={pending} disabled={totp.length !== AUTH.totpLength}>
                   Entrar no painel
                 </PrimaryButton>
 
-                {factor.next === "verify" && (
+                {(factor.next === "verify" || factor.next === "login") && (
                   <div className="flex justify-end">
                     <LinkButton onClick={() => setShowLostHelp((v) => !v)} aria-expanded={showLostHelp}>
                       Perdi o acesso ao autenticador
@@ -309,8 +339,8 @@ export function LoginFlow({ initial }: { initial: Initial }) {
         )}
 
         <InfoCallout>
-          <strong>Primeiro acesso?</strong> O convite chegou por e-mail. Entre com o mesmo endereço e
-          configure o app autenticador quando for pedido.
+          <strong>Primeiro acesso?</strong> Entre com o e-mail do convite: vamos enviar um código e você
+          configura o app autenticador. Nos próximos acessos, basta o código do app.
         </InfoCallout>
       </div>
     </div>

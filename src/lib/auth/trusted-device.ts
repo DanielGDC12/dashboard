@@ -5,31 +5,38 @@ import { AUTH } from "@/lib/env";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getRequestInfo } from "./request-info";
 
+/**
+ * "Lembrar meu e-mail neste computador".
+ * Desde o login só por MFA, o dispositivo lembrado NÃO pula nenhum fator: ele só
+ * preenche o e-mail e leva direto ao código do app autenticador.
+ * (Tabela e cookie mantêm o nome antigo, trusted_devices / mtq_trusted_device.)
+ */
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
 
-/**
- * True when this browser holds a valid, non-expired trusted-device token that
- * belongs to `userId`. Read-only (safe in Server Components).
- */
-export async function isTrustedDevice(userId: string): Promise<boolean> {
+async function findDevice() {
   const token = (await cookies()).get(AUTH.trustedDeviceCookie)?.value;
-  if (!token) return false;
-
-  const admin = createAdminClient();
-  const { data } = await admin
+  if (!token) return null;
+  const { data } = await createAdminClient()
     .from("trusted_devices")
-    .select("id")
+    .select("id, user_id")
     .eq("token_hash", hash(token))
-    .eq("user_id", userId)
     .is("revoked_at", null)
     .gt("expires_at", new Date().toISOString())
     .maybeSingle();
-
-  return Boolean(data);
+  return data;
 }
 
-/** Updates last_used_at. Call only from Server Actions / Route Handlers. */
-export async function touchTrustedDevice(userId: string) {
+/** E-mail lembrado neste navegador (ou null). Somente leitura: seguro em Server Components. */
+export async function getRememberedEmail(): Promise<string | null> {
+  const device = await findDevice();
+  if (!device) return null;
+  const { data, error } = await createAdminClient().auth.admin.getUserById(device.user_id);
+  if (error || !data.user?.email) return null;
+  return data.user.email;
+}
+
+/** Atualiza last_used_at. Só em Server Actions / Route Handlers. */
+export async function touchRememberedDevice(userId: string) {
   const token = (await cookies()).get(AUTH.trustedDeviceCookie)?.value;
   if (!token) return;
   await createAdminClient()
@@ -40,10 +47,16 @@ export async function touchTrustedDevice(userId: string) {
 }
 
 /**
- * Creates a trusted device for `userId` and sets the httpOnly cookie.
- * Must only be called right after a successful TOTP verification.
+ * Lembra este computador para `userId` e grava o cookie httpOnly.
+ * Chamar só logo depois de uma verificação TOTP bem-sucedida.
  */
-export async function trustThisDevice(userId: string) {
+export async function rememberThisDevice(userId: string) {
+  const existing = await findDevice();
+  if (existing?.user_id === userId) {
+    await touchRememberedDevice(userId);
+    return "touched" as const;
+  }
+
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + AUTH.trustedDeviceDays * 86_400_000);
   const { ip, userAgent } = await getRequestInfo();
@@ -64,4 +77,18 @@ export async function trustThisDevice(userId: string) {
     path: "/",
     expires: expiresAt,
   });
+  return "created" as const;
+}
+
+/** "Trocar" de conta: esquece o e-mail lembrado neste navegador. */
+export async function forgetThisDevice() {
+  const store = await cookies();
+  const token = store.get(AUTH.trustedDeviceCookie)?.value;
+  if (!token) return;
+  await createAdminClient()
+    .from("trusted_devices")
+    .update({ revoked_at: new Date().toISOString() })
+    .eq("token_hash", hash(token))
+    .is("revoked_at", null);
+  store.delete(AUTH.trustedDeviceCookie);
 }

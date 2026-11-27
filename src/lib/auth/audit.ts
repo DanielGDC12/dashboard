@@ -10,6 +10,7 @@ export type AuthAuditEvent =
   | "mfa_enrolled"
   | "mfa_verified"
   | "mfa_failed"
+  | "mfa_login_locked"
   | "trusted_device_created"
   | "trusted_device_used"
   | "logout";

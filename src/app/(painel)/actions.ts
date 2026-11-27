@@ -12,6 +12,6 @@ export async function signOut() {
   if (state.status === "authenticated") {
     await audit("logout", { email: state.user.email, userId: state.user.authId });
   }
-  // The trusted-device cookie is kept on purpose: it trusts the computer, not the session.
+  // O cookie do computador lembrado fica: ele só preenche o e-mail, o MFA continua obrigatório.
   redirect("/login");
 }

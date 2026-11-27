@@ -5,17 +5,24 @@ import { isAuthApiError, type SupabaseClient } from "@supabase/supabase-js";
 import { AUTH } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 import { findAllowedUser, normalizeEmail, type AllowedUser } from "@/lib/auth/whitelist";
-import { isTrustedDevice, touchTrustedDevice, trustThisDevice } from "@/lib/auth/trusted-device";
+import { forgetThisDevice, rememberThisDevice } from "@/lib/auth/trusted-device";
+import { getLoginStatus, isLockedOut, signInWithTotp, type LoginStatus } from "@/lib/auth/mfa-login";
 import { audit } from "@/lib/auth/audit";
 import { getSessionState } from "@/lib/auth/dal";
 
 // ---------------------------------------------------------------------------
-// Types shared with the client
+// Fluxo
+//   Primeiro acesso: e-mail → código por e-mail → cadastro do app autenticador.
+//   Acessos seguintes: e-mail → código do app autenticador (sem e-mail).
 // ---------------------------------------------------------------------------
 export type SecondFactor =
   | { next: "done" }
+  /** Já existe sessão aal1 (veio do código por e-mail): verificar TOTP nela. */
   | { next: "verify"; factorId: string }
-  | { next: "enroll"; factorId: string; qrCode: string; secret: string };
+  /** Primeiro acesso: cadastrar o app autenticador. */
+  | { next: "enroll"; factorId: string; qrCode: string; secret: string }
+  /** Acesso recorrente: login só com o código do app (sem sessão prévia). */
+  | { next: "login" };
 
 type Fail = { ok: false; error: string };
 type Ok<T = object> = { ok: true } & T;
@@ -25,8 +32,11 @@ const MSG = {
   notAllowed:
     "Este e-mail não tem acesso ao Painel de Entregas. Peça um convite a um administrador.",
   rateLimited: "Muitas tentativas. Aguarde um minuto e tente de novo.",
+  lockedOut:
+    "Muitos códigos incorretos. Por segurança, o login deste e-mail foi bloqueado por alguns minutos. Tente de novo mais tarde ou fale com um administrador.",
   badEmailCode: "Código inválido ou expirado. Confira o e-mail ou peça um novo código.",
   badTotp: "Código incorreto. Confira se o horário do celular está automático e tente de novo.",
+  noAuthenticator: "Este e-mail ainda não tem um app autenticador configurado. Comece de novo pelo e-mail.",
   sessionLost: "Sua sessão expirou. Comece de novo pelo e-mail.",
   generic: "Não foi possível concluir agora. Tente de novo em instantes.",
   config:
@@ -45,26 +55,21 @@ async function checkWhitelist(email: string): Promise<{ allowed: AllowedUser | n
   }
 }
 
+async function checkLoginStatus(email: string): Promise<{ status: LoginStatus } | Fail> {
+  try {
+    return { status: await getLoginStatus(email) };
+  } catch (err) {
+    console.error("[auth] login status failed", err);
+    return { ok: false, error: MSG.config };
+  }
+}
+
 function authErrorMessage(error: unknown, fallback: string) {
   if (isAuthApiError(error) && error.status === 429) return MSG.rateLimited;
   return fallback;
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 — e-mail → whitelist → send e-mail code
-// ---------------------------------------------------------------------------
-export async function requestEmailCode(rawEmail: string): Promise<Ok | Fail> {
-  const parsed = emailSchema.safeParse(rawEmail);
-  if (!parsed.success) return { ok: false, error: MSG.invalidEmail };
-  const email = parsed.data;
-
-  const check = await checkWhitelist(email);
-  if ("ok" in check) return check;
-  if (!check.allowed) {
-    await audit("login_denied_not_allowed", { email });
-    return { ok: false, error: MSG.notAllowed };
-  }
-
+async function sendEmailCode(email: string): Promise<Ok | Fail> {
   const supabase = await createClient();
   // Drop any half-finished session from another account on this browser.
   await supabase.auth.signOut({ scope: "local" });
@@ -87,7 +92,51 @@ export async function requestEmailCode(rawEmail: string): Promise<Ok | Fail> {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 — verify e-mail code → decide second factor
+// Step 1 — e-mail → whitelist → primeiro acesso (código por e-mail) ou TOTP
+// ---------------------------------------------------------------------------
+export async function startLogin(rawEmail: string): Promise<Ok<{ next: "code" | "totp" }> | Fail> {
+  const parsed = emailSchema.safeParse(rawEmail);
+  if (!parsed.success) return { ok: false, error: MSG.invalidEmail };
+  const email = parsed.data;
+
+  const check = await checkWhitelist(email);
+  if ("ok" in check) return check;
+  if (!check.allowed) {
+    await audit("login_denied_not_allowed", { email });
+    return { ok: false, error: MSG.notAllowed };
+  }
+
+  const login = await checkLoginStatus(email);
+  if ("ok" in login) return login;
+
+  if (login.status.totpFactorId) {
+    // Acesso recorrente: só o código do app autenticador.
+    const supabase = await createClient();
+    await supabase.auth.signOut({ scope: "local" });
+    return { ok: true, next: "totp" };
+  }
+
+  const sent = await sendEmailCode(email);
+  if (!sent.ok) return sent;
+  return { ok: true, next: "code" };
+}
+
+/** "Não recebi o código" (só no primeiro acesso). */
+export async function requestEmailCode(rawEmail: string): Promise<Ok | Fail> {
+  const parsed = emailSchema.safeParse(rawEmail);
+  if (!parsed.success) return { ok: false, error: MSG.invalidEmail };
+
+  const check = await checkWhitelist(parsed.data);
+  if ("ok" in check) return check;
+  if (!check.allowed) {
+    await audit("login_denied_not_allowed", { email: parsed.data });
+    return { ok: false, error: MSG.notAllowed };
+  }
+  return sendEmailCode(parsed.data);
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 (primeiro acesso) — verify e-mail code → cadastrar autenticador
 // ---------------------------------------------------------------------------
 export async function verifyEmailCode(
   rawEmail: string,
@@ -125,7 +174,7 @@ export async function verifyEmailCode(
   }
 
   await audit("email_code_verified", { email: email.data, userId: data.user.id });
-  return resolveSecondFactor(supabase, data.user.id, email.data);
+  return resolveSecondFactor(supabase);
 }
 
 /** Called when /login is reopened with an aal1 session (e.g. after refresh). */
@@ -133,14 +182,10 @@ export async function resumeSecondFactor(): Promise<Ok<{ factor: SecondFactor }>
   const state = await getSessionState();
   if (state.status === "authenticated") return { ok: true, factor: { next: "done" } };
   if (state.status !== "needs_mfa") return { ok: false, error: MSG.sessionLost };
-  return resolveSecondFactor(await createClient(), state.userId, state.email);
+  return resolveSecondFactor(await createClient());
 }
 
-async function resolveSecondFactor(
-  supabase: SupabaseClient,
-  userId: string,
-  email: string,
-): Promise<Ok<{ factor: SecondFactor }> | Fail> {
+async function resolveSecondFactor(supabase: SupabaseClient): Promise<Ok<{ factor: SecondFactor }> | Fail> {
   const { data: factors, error } = await supabase.auth.mfa.listFactors();
   if (error) {
     console.error("[auth] listFactors failed", { status: error.status, code: error.code, message: error.message });
@@ -148,13 +193,6 @@ async function resolveSecondFactor(
   }
 
   const verified = factors.totp[0];
-
-  if (verified && (await isTrustedDevice(userId))) {
-    await touchTrustedDevice(userId);
-    await audit("trusted_device_used", { email, userId });
-    return { ok: true, factor: { next: "done" } };
-  }
-
   if (verified) return { ok: true, factor: { next: "verify", factorId: verified.id } };
 
   // First access: clean up abandoned enrollments, then enroll a new TOTP factor.
@@ -185,13 +223,25 @@ async function resolveSecondFactor(
   };
 }
 
+/** Grava ou esquece o "lembrar meu e-mail" depois de um TOTP correto. */
+async function applyRememberChoice(remember: boolean, email: string, userId: string) {
+  try {
+    if (!remember) return await forgetThisDevice();
+    const result = await rememberThisDevice(userId);
+    await audit(result === "created" ? "trusted_device_created" : "trusted_device_used", { email, userId });
+  } catch (err) {
+    // O login continua valendo; só não lembramos o e-mail.
+    console.error("[auth] remember device failed", err);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Step 3 — verify authenticator code (+ optionally trust this computer)
+// Step 3a — código do app numa sessão aal1 (primeiro acesso / sessão retomada)
 // ---------------------------------------------------------------------------
 export async function verifyTotp(input: {
   factorId: string;
   code: string;
-  trustDevice: boolean;
+  rememberDevice: boolean;
   enrolling: boolean;
 }): Promise<Ok | Fail> {
   const code = codeSchema(AUTH.totpLength).safeParse(input.code);
@@ -205,6 +255,11 @@ export async function verifyTotp(input: {
   const userId = state.status === "needs_mfa" ? state.userId : state.user.authId;
   const email = state.status === "needs_mfa" ? state.email : state.user.email;
 
+  if (await isLockedOut(email)) {
+    await audit("mfa_login_locked", { email, userId });
+    return { ok: false, error: MSG.lockedOut };
+  }
+
   const supabase = await createClient();
   const { error } = await supabase.auth.mfa.challengeAndVerify({
     factorId: factorId.data,
@@ -212,30 +267,75 @@ export async function verifyTotp(input: {
   });
 
   if (error) {
-    await audit("mfa_failed", { email, userId, metadata: { status: error.status } });
+    await audit("mfa_failed", { email, userId, metadata: { status: error.status, mode: input.enrolling ? "enroll" : "session" } });
     return { ok: false, error: authErrorMessage(error, MSG.badTotp) };
   }
 
   await audit(input.enrolling ? "mfa_enrolled" : "mfa_verified", { email, userId });
-
-  if (input.trustDevice) {
-    try {
-      await trustThisDevice(userId);
-      await audit("trusted_device_created", { email, userId });
-    } catch (err) {
-      // Login still succeeds; the user will just be asked for the code next time.
-      console.error("[auth] trust device failed", err);
-    }
-  }
-
+  await applyRememberChoice(input.rememberDevice, email, userId);
   return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
-// "Trocar" — start over with another e-mail
+// Step 3b — acesso recorrente: e-mail + código do app, sem código por e-mail
+// ---------------------------------------------------------------------------
+export async function verifyTotpLogin(input: {
+  email: string;
+  code: string;
+  rememberDevice: boolean;
+}): Promise<Ok | Fail> {
+  const email = emailSchema.safeParse(input.email);
+  if (!email.success) return { ok: false, error: MSG.sessionLost };
+  const code = codeSchema(AUTH.totpLength).safeParse(input.code);
+  if (!code.success) return { ok: false, error: MSG.badTotp };
+
+  const check = await checkWhitelist(email.data);
+  if ("ok" in check) return check;
+  if (!check.allowed) {
+    await audit("login_denied_not_allowed", { email: email.data });
+    return { ok: false, error: MSG.notAllowed };
+  }
+
+  const login = await checkLoginStatus(email.data);
+  if ("ok" in login) return login;
+  const { userId, totpFactorId } = login.status;
+  if (!userId || !totpFactorId) return { ok: false, error: MSG.noAuthenticator };
+
+  if (await isLockedOut(email.data)) {
+    await audit("mfa_login_locked", { email: email.data, userId });
+    return { ok: false, error: MSG.lockedOut };
+  }
+
+  const result = await signInWithTotp({ email: email.data, factorId: totpFactorId, code: code.data });
+  if (!result.ok) {
+    if (result.reason === "bad_code") {
+      await audit("mfa_failed", { email: email.data, userId, metadata: { status: result.status, mode: "totp_login" } });
+      return { ok: false, error: MSG.badTotp };
+    }
+    return { ok: false, error: result.status === 429 ? MSG.rateLimited : MSG.generic };
+  }
+
+  const supabase = await createClient();
+  const { error } = await supabase.auth.setSession({
+    access_token: result.accessToken,
+    refresh_token: result.refreshToken,
+  });
+  if (error) {
+    console.error("[auth] setSession failed", { status: error.status, code: error.code });
+    return { ok: false, error: MSG.generic };
+  }
+
+  await audit("mfa_verified", { email: email.data, userId, metadata: { mode: "totp_login" } });
+  await applyRememberChoice(input.rememberDevice, email.data, userId);
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// "Trocar" — start over with another e-mail (e esquece o e-mail lembrado)
 // ---------------------------------------------------------------------------
 export async function switchAccount(): Promise<Ok> {
   const supabase = await createClient();
   await supabase.auth.signOut({ scope: "local" });
+  await forgetThisDevice();
   return { ok: true };
 }
